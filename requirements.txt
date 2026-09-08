@@ -1,0 +1,20 @@
+# Orquestacion
+langchain
+langchain-core
+langchain-community        # BM25Retriever
+langchain-classic          # EnsembleRetriever (movido aca en LangChain 1.x)
+langchain-text-splitters
+
+# Embeddings: gemini-embedding-001 con output_dimensionality=1536
+langchain-google-genai
+
+# Vector store en la nube
+langchain-pinecone
+pinecone
+
+# BM25 necesita este backend
+rank_bm25
+
+# Utilidades
+python-dotenv
+tiktoken                   # conteo de tokens real para el chunking

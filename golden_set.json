@@ -1,0 +1,81 @@
+{
+  "descripcion": "Benchmark de recuperacion sobre la documentacion de conceptos de Pydantic (v2.13.5). Cada caso declara que documento(s) contienen realmente la respuesta, verificado a mano sobre el corpus.",
+  "formato": "Se acepta 'documentos_esperados' (lista) o 'documento_id_esperado' (string). La lista existe para los casos donde la respuesta vive de verdad en mas de un documento: con un unico documento relevante, Recall@k solo puede dar 0 o 1 y la metrica pierde resolucion.",
+  "tipos": {
+    "lexica": "La pregunta nombra un identificador exacto y poco ambiguo. Es donde BM25 deberia ganarle al vectorial.",
+    "semantica": "La pregunta describe el problema sin nombrar ninguna API. Es donde el vectorial deberia ganarle a BM25.",
+    "mixta": "Nombra un identificador que aparece repartido en varios documentos. Ninguno de los dos deberia resolverla solo."
+  },
+  "casos": [
+    {
+      "id": "alias-generador",
+      "pregunta": "Como uso AliasGenerator para generar alias automaticamente para todos los campos del modelo?",
+      "documentos_esperados": ["alias.md"],
+      "tipo": "lexica",
+      "nota": "AliasGenerator aparece 8 veces en el corpus y las 8 estan en alias.md."
+    },
+    {
+      "id": "json-schema-extra",
+      "pregunta": "Para que sirve json_schema_extra y como agrego ejemplos al JSON Schema generado?",
+      "documentos_esperados": ["json_schema.md"],
+      "tipo": "lexica",
+      "nota": "23 de 24 apariciones estan en json_schema.md."
+    },
+    {
+      "id": "computed-field",
+      "pregunta": "Como defino un computed_field para que una propiedad calculada aparezca en la serializacion?",
+      "documentos_esperados": ["fields.md"],
+      "tipo": "lexica",
+      "nota": "10 de 11 apariciones estan en fields.md."
+    },
+    {
+      "id": "union-discriminada",
+      "pregunta": "Que hace el argumento discriminator en una union etiquetada y como lo declaro?",
+      "documentos_esperados": ["unions.md"],
+      "tipo": "lexica",
+      "nota": "38 de 47 apariciones de discriminator estan en unions.md."
+    },
+    {
+      "id": "serializador-de-campo",
+      "pregunta": "Como escribo un field_serializer personalizado para cambiar como se exporta un campo?",
+      "documentos_esperados": ["serialization.md"],
+      "tipo": "lexica",
+      "nota": "11 de 13 apariciones estan en serialization.md."
+    },
+    {
+      "id": "sin-coercion",
+      "pregunta": "Como evito que Pydantic convierta automaticamente un string en numero al validar?",
+      "documentos_esperados": ["strict_mode.md"],
+      "tipo": "semantica",
+      "nota": "La pregunta no nombra 'strict' en ningun lado: el vectorial tiene que salvarla sola."
+    },
+    {
+      "id": "modelo-autorreferente",
+      "pregunta": "Que hago si un modelo se referencia a si mismo y el tipo todavia no existe cuando Python lee la clase?",
+      "documentos_esperados": ["forward_annotations.md", "models.md"],
+      "tipo": "semantica",
+      "nota": "Los dos documentos cubren modelos autorreferentes; por eso el caso lista dos y el Recall@5 puede dar 0.5."
+    },
+    {
+      "id": "validacion-mas-rapida",
+      "pregunta": "Que recomendaciones hay para que la validacion de mis modelos sea mas rapida?",
+      "documentos_esperados": ["performance.md"],
+      "tipo": "semantica",
+      "nota": "La palabra 'performance' aparece en 5 documentos: BM25 sin contexto se dispersa."
+    },
+    {
+      "id": "type-adapter-lista",
+      "pregunta": "Como valido una lista de diccionarios con TypeAdapter sin tener que crear un BaseModel?",
+      "documentos_esperados": ["type_adapter.md"],
+      "tipo": "mixta",
+      "nota": "TypeAdapter se menciona 97 veces repartidas en 8 documentos: el termino exacto no alcanza para desambiguar."
+    },
+    {
+      "id": "validador-de-modelo",
+      "pregunta": "Como corro una validacion sobre el modelo completo despues de construirlo, con model_validator en modo after?",
+      "documentos_esperados": ["validators.md"],
+      "tipo": "mixta",
+      "nota": "model_validator aparece tambien en dataclasses.md, fields.md y models.md."
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+# Fuente del corpus
+
+Los archivos `.md` de esta carpeta son documentación de **Pydantic**, descargados sin
+modificar desde el repositorio oficial:
+
+- Repositorio: https://github.com/pydantic/pydantic
+- Ruta: `docs/concepts/`
+- Tag: `v2.13.5` (clavado para que el corpus sea reproducible)
+- Documentación publicada: https://docs.pydantic.dev/latest/concepts/
+- Licencia: MIT
+
+Para regenerarlos: `python scripts/descargar_dataset.py`
