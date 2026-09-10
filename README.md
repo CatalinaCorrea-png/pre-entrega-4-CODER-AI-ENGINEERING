@@ -244,187 +244,7 @@ y la recuperación, y que tiene que coincidir en los tres.
 La inicialización es **perezosa**: importar `rag` no contacta a Pinecone ni descarga el
 corpus. `RAGSystem` paga ese trabajo en la primera consulta y lo cachea.
 
-## Decisiones de diseño
-
-### Por qué documentación de Pydantic y no un corpus genérico
-
-El corpus decide si el recuperador híbrido tiene algo que fusionar o es decorativo. La
-documentación técnica está llena de identificadores exactos —`TypeAdapter`,
-`model_validator`, `AliasGenerator`, `json_schema_extra`— que en principio son el terreno de
-BM25: son literales distintos, aunque hablen todos de "validar modelos". Sobre un corpus de
-prosa general, la búsqueda léxica no tendría ninguna carta que jugar.
-
-La hipótesis era que BM25 ganaría en esas preguntas y el vectorial en las reformulaciones.
-**La medición la desmintió a medias**: BM25 sirve, pero el vectorial le gana también en las
-léxicas. El corpus igual cumplió su función — permitió montar el experimento que muestra
-dónde se rompe cada mitad. Ver [Qué dicen estos números](#qué-dicen-estos-números).
-
-### Chunking: el parámetro no es el tamaño real
-
-La consigna pide apuntar a 500-800 tokens. Lo que importa es el tamaño **realizado**: el
-splitter corta en límites naturales del texto y nunca llena el cupo. Medido sobre este
-corpus:
-
-| separadores | `chunk_size` | fragmentos | mediana | en 500-800 | menos de 120 tokens |
-|---|---|---|---|---|---|
-| encabezados | 600 | 258 | 305 | 0 | 19 |
-| encabezados | 800 | 200 | 396 | 52 | 12 |
-| párrafos | 600 | 220 | 390 | 2 | 4 |
-| **párrafos** | **800** | **162** | **528** | **95** | **0** |
-
-Con `chunk_size=600` y separadores por encabezado —lo más intuitivo para Markdown— la
-mediana real daba 305 tokens, por debajo del rango pedido, y 19 fragmentos quedaban por
-debajo de 120 tokens: líneas sueltas que no responden nada y que igual ocupan un vector.
-La configuración elegida (`\n\n` como primer separador, `chunk_size=800`, overlap 140) deja
-la mediana en 528 y ningún fragmento minúsculo.
-
-### Un solo número para la dimensión
-
-`DIMENSION = 1536` vive en `rag/pinecone.py` y de ahí la leen el setup del índice y la
-ingesta. El "mismatch de dimensiones" que la consigna marca como error típico solo puede
-ocurrir si el número está escrito dos veces y las copias divergen. Además,
-`crear_indice_si_falta()` compara contra el índice existente y aborta antes de generar el
-primer embedding — el error aparece en el segundo 0, no a mitad de una ingesta ya facturada.
-
-`gemini-embedding-001` produce 3072 dimensiones y acepta `output_dimensionality`. Recortar a
-1536 no es truncar a ciegas: el modelo se entrena con Matryoshka Representation Learning,
-que concentra la información más significativa en las primeras componentes.
-
-Al recortar por debajo de 3072, Gemini devuelve los vectores **sin normalizar** (norma
-medida ~0.69). Con métrica coseno es indistinto, porque el coseno divide por las normas;
-si alguien cambiara el índice a `dotproduct`, la magnitud entraría directo en el score y
-el ranking quedaría sesgado hacia los vectores más largos.
-
-### Dos lotes, dos límites
-
-La clase fija el punto dulce del batch upsert en 100-200 vectores. Pero en una ingesta hay
-**dos** lotes, y los limita un servicio distinto cada uno:
-
-| Lote | Lo acota | Tamaño |
-|---|---|---|
-| Embedding | Gemini, por tokens por minuto | 15 fragmentos (~8.000 tokens) |
-| Upsert | Pinecone, por tamaño de request | 100 vectores |
-
-Este proyecto lo descubrió chocándose: el primer intento embebía y subía de a 100 con
-`PineconeVectorStore.add_documents()`, y Gemini devolvía `429 RESOURCE_EXHAUSTED` en el
-primer lote — 100 fragmentos de este corpus son ~50.000 tokens de golpe. Midiendo contra la
-API, ~8.000 tokens pasan y ~16.000 ya fallan.
-
-Por eso la ingesta corre en dos fases explícitas (`embeber()` y `subir()` en
-`rag/ingesta.py`) en lugar de delegar ambas en el vectorstore, que las hace juntas y
-deja el tamaño del lote de embedding fuera de nuestro control. Entre lotes de embedding hay
-una pausa de 20 segundos para no volver a agotar la cuota, y el backoff de los reintentos
-arranca en 65 segundos: la cuota de Gemini se repone por ventana de un minuto, así que un
-backoff que arranca en 4 segundos agota los tres intentos dentro de la misma ventana y falla
-igual, solo que más tarde.
-
-La contrapartida es que el texto original hay que escribirlo a mano en `metadata["text"]`
-en vez de dejar que lo haga `PineconeVectorStore`. No es una pérdida: la consigna pide
-guardar el contenido en la metadata, y así queda explícito en el pipeline en lugar de ser un
-efecto secundario del vectorstore. El lado de la recuperación sigue usando
-`PineconeVectorStore` y lee de la misma clave — la consigna admite las dos vías, y acá cada
-una se usa donde encaja.
-
-### `task_type`: el documento y la pregunta no se embeben igual
-
-Gemini pide declarar para qué se usa cada vector. La ingesta usa `RETRIEVAL_DOCUMENT` y la
-consulta `RETRIEVAL_QUERY`: el modelo proyecta distinto un pasaje que se va a indexar que
-una pregunta que lo busca. Por eso `obtener_vectorstore()` se cachea **por `task_type`**.
-
-### El corpus de BM25 sale de Pinecone, no del disco
-
-BM25 no es un servicio: es un índice invertido en memoria que necesita el texto de todos
-los fragmentos. Lo obvio sería releer `data/` y volver a fragmentar — y ahí aparecen dos
-corpus, el indexado en la nube y el del disco de quien corre el script. Si alguien edita
-`data/` sin reingestar, o cambia `CHUNK_SIZE`, el ensemble fusiona rankings de universos
-distintos. No falla: devuelve métricas que no significan nada.
-
-`rag/recuperacion.py` pagina el namespace y reconstruye los fragmentos desde
-`metadata["text"]` — que es exactamente para lo que la consigna pide guardar el texto ahí.
-Una sola fuente de verdad. `--corpus local` queda como salida de emergencia sin red.
-
-### El tokenizador de BM25
-
-`BM25Retriever` tokeniza por defecto con `str.split()`. Sobre esta consulta:
-
-```
-"¿Cómo uso TypeAdapter?".split()  ->  ["¿Cómo", "uso", "TypeAdapter?"]
-```
-
-`TypeAdapter?` con el signo pegado no es el mismo término que el `TypeAdapter` del
-documento, así que la coincidencia exacta —el único aporte real de BM25 frente al
-vectorial— no ocurre. `rag/recuperacion.py` normaliza ambos lados igual:
-minúsculas, sin acentos, cortando por todo lo que no sea letra, dígito o guion bajo. El
-guion bajo se conserva porque en Python es parte del identificador: `model_validator` es un
-término, no dos.
-
-### RRF, no suma de scores
-
-`EnsembleRetriever` aplica Reciprocal Rank Fusion: puntúa cada documento por
-`1/(60 + posición)` en cada ranking y suma esas contribuciones ponderadas. Fusiona
-**posiciones, no puntajes**, que es la advertencia explícita de la clase: un score de BM25
-puede valer 14.7 y un coseno 0.83, y sumarlos deja que la escala arbitraria de BM25 domine
-el resultado.
-
-El ensemble devuelve la unión de ambos rankings, hasta 2k documentos.
-`RAGSystem.recuperar()` recorta a `k`: sin ese corte, "top-5" sería un top-10 disfrazado y
-la Precision@5 estaría midiendo otra cosa.
-
-### Metadatos: un esquema, no campos sueltos
-
-`rag/ingesta.py` es el único lugar donde se construye la metadata, y `CAMPOS`
-documenta el contrato. Es la defensa contra el **schema drift** de la clase: si un proceso
-escribe `categoria` y otro `category`, ningún filtro falla — devuelven cero resultados y el
-sistema parece andar. La categoría (`modelado`, `validacion`, `serializacion`, `tipos`,
-`configuracion`) habilita el hard filter: `--categoria validacion` acota el espacio de
-búsqueda antes de comparar similitud.
-
-Los nueve campos: `text`, `source`, `titulo`, `categoria`, `doc_type`, `chunk_index`,
-`total_chunks`, `n_caracteres` y `url`. La consigna menciona *página* entre los metadatos
-esperados; este corpus es Markdown y no tiene paginación, así que el análogo posicional son
-`chunk_index` / `total_chunks`, que ubican cada fragmento dentro de su documento. `url`
-cumple la otra mitad de esa función: permite citar la fuente exacta y verificable.
-
-`titulo` estuvo mal calculado hasta que se detectó auditando la metadata ingestada. MkDocs
-saca el título de la navegación, no del cuerpo, y 14 de los 16 documentos no tienen ningún
-H1: el campo caía al nombre de archivo y quedaba duplicando `source` — peso muerto en cada
-uno de los 162 vectores. Peor todavía, la búsqueda del H1 recorría todo el documento y un
-comentario de Python dentro de un bloque de código también empieza con `# `, así que
-`models.md` terminó titulado *"normal copy gives the same object reference for bar:"*. Ahora
-se mira solo la primera línea con contenido, con respaldo derivado del nombre de archivo
-(`json_schema.md` → *JSON Schema*), y hay dos pruebas que lo cubren.
-
-### IDs determinísticos
-
-El id de cada vector es `archivo.md::n`, no un UUID. Con UUIDs, reingestar el mismo corpus
-duplica cada fragmento y el top-5 se llena de copias del mismo texto: la precisión medida
-sube sin que el sistema haya mejorado en nada. Con este esquema, reingestar sobrescribe —
-que es lo que la palabra *upsert* promete.
-
-### Namespace
-
-Todo el corpus vive en `pydantic-concepts-v1`, configurable por entorno. El sufijo de
-versión es deliberado: cambiar el chunking implica un corpus distinto, y levantarlo en un
-namespace nuevo permite comparar ambos sin destruir el anterior.
-
 ## Evaluación
-
-### Cómo está armado el golden set
-
-10 preguntas, cada una con los documentos que **realmente** contienen la respuesta,
-verificados a mano contra el corpus. Están clasificadas por tipo, y esa clasificación es el
-experimento:
-
-| tipo | n | qué mide |
-|---|---|---|
-| `lexica` | 5 | Nombra un identificador exacto y poco ambiguo (`AliasGenerator`: 8 de 8 apariciones en `alias.md`). Debería ganar BM25. |
-| `semantica` | 3 | Describe el problema sin nombrar ninguna API. Debería ganar el vectorial. |
-| `mixta` | 2 | Nombra un identificador repartido en varios documentos (`TypeAdapter`: 97 apariciones en 8 archivos). Ninguno debería resolverla solo. |
-
-Dos casos declaran **más de un** documento relevante. El notebook de la clase señala que
-con un único `documento_id_esperado` el Recall@5 solo puede dar 0 o 1; con dos documentos
-relevantes puede dar 0.5, y la métrica distingue "recuperó la mitad" de "no recuperó nada".
-`rag/evaluacion.py` acepta igual el formato de un solo documento de la consigna.
 
 ### Cómo se calculan las métricas
 
@@ -474,60 +294,34 @@ Barrido de pesos del ensemble:
 
 ### Qué dicen estos números
 
-**1. BM25 falla exactamente donde se predijo, y falla feo.** Recall 0.17 en las preguntas
-semánticas: de las tres, dos no recuperaron el documento correcto en ninguna posición. A
-"¿qué recomendaciones hay para que la validación sea más rápida?" devolvió cinco fragmentos
-de `validators.md` y ninguno de `performance.md` — la palabra "validación" está en la
-consulta y en el documento equivocado, y BM25 no tiene forma de saber que el tema es otro.
+**BM25 falla donde se predijo.** Recall 0.17 en las semánticas: dos de las tres preguntas no
+recuperaron el documento correcto en ninguna posición. A *"¿qué recomendaciones hay para que
+la validación sea más rápida?"* devolvió cinco fragmentos de `validators.md` y ninguno de
+`performance.md` — la palabra "validación" está en el documento equivocado y BM25 no puede
+saber que el tema es otro.
 
-**2. El vectorial es mucho más fuerte de lo que anticipaba el diseño del benchmark.** Gana
-incluso en las preguntas *léxicas*, donde BM25 supuestamente tenía la ventaja: recupera
-`AliasGenerator`, `json_schema_extra` y `field_serializer` con recall 1.00 y MRR 1.00. Dos
-razones. Una, `gemini-embedding-001` a 1536 dimensiones representa bien los identificadores
-de código, que no son "ruido" para él. Dos, es multilingüe: las preguntas están en español y
-el corpus en inglés, un desajuste que a BM25 lo deja sin nada que hacer salvo el
-identificador suelto, y que al vectorial no lo afecta.
+**El vectorial gana incluso en las preguntas léxicas**, donde BM25 tenía que tener la
+ventaja. Dos razones: `gemini-embedding-001` representa bien los identificadores de código, y
+es multilingüe — las preguntas están en español y el corpus en inglés, un desajuste que a
+BM25 lo deja sin nada salvo el identificador suelto.
 
-**3. El híbrido no mejora al vectorial: lo empata en recall y lo empeora en precisión.**
-Recupera todo lo que BM25 pierde (semánticas de 0.17 a 1.00), pero contra el vectorial solo
-pierde 12 puntos de precisión (0.74 → 0.62) y 15 de MRR (0.95 → 0.80). El mecanismo se ve en
-el detalle: en la pregunta de coerción, el vectorial devuelve `strict_mode.md` en las
-posiciones 1, 2 y 3; el híbrido lo baja a las posiciones 2 y 4 porque RRF le da a BM25 —que
-ahí no acertó ninguno— el mismo voto que al vectorial, y sube documentos que solo BM25
-rankeó alto.
+**El híbrido empata en recall y pierde precisión:** −12 puntos de P@5 (0.74 → 0.62) y −15 de
+MRR (0.95 → 0.80) contra el vectorial solo. RRF le da a BM25 el mismo voto aunque ahí no haya
+acertado, y eso empuja hacia abajo lo que el vectorial ya tenía primero. El barrido lo
+confirma: es monótono a favor del vectorial, y en 0.3/0.7 el híbrido converge exactamente en
+los números del vectorial puro.
 
-**4. El barrido es monótono y no tiene punto óptimo interior.** Cada punto de peso que se le
-saca a BM25 mejora *todas* las métricas, y en 0.3/0.7 el híbrido converge exactamente en los
-números del vectorial puro (0.74 / 1.00 / 0.95). No hay una mezcla que supere a ninguna de
-las dos partes: la mejor configuración del ensemble es la que más se parece a no tener
-ensemble.
+**Conclusión: acá el híbrido es un seguro, no una mejora.** Paga ~12 puntos de precisión para
+cubrir un modo de falla que este vectorial no tiene sobre este corpus. Dónde sí pagaría: con
+un modelo más débil o monolingüe, o con identificadores sin carga semántica (`ERR-4021`,
+SKUs) donde BM25 es el único que puede encontrar el término. Nada de eso se afirma sin
+medirlo — por eso `evaluate.py` compara tres configuraciones y no solo el híbrido.
 
-**Aclaración importante, porque el número se puede leer mal:** que el híbrido no le gane al
-vectorial **no** indica que el ensemble esté mal implementado. La prueba de que la fusión
-funciona es la fila de las semánticas: BM25 solo tiene 0.17 de recall ahí, y al fusionarlo
-con el vectorial el híbrido sube a 1.00. El ensemble está recuperando exactamente lo que
-tiene que recuperar. Lo que el experimento muestra es una propiedad *de este corpus con este
-modelo de embeddings*, no un defecto del código.
-
-**5. Conclusión honesta: acá el híbrido es un seguro, no una mejora.** Cuesta ~12 puntos de
-precisión para cubrir un modo de falla que este recuperador vectorial no tiene sobre este
-corpus. Eso no invalida la técnica, delimita cuándo paga: con un modelo de embeddings más
-débil o monolingüe en inglés, o con identificadores sin ninguna carga semántica —códigos de
-error tipo `ERR-4021`, SKUs, números de parte— donde BM25 es literalmente el único de los dos
-que puede encontrar el término. Nada de eso se puede afirmar sin medirlo, que es justamente
-por qué `evaluate.py` compara tres configuraciones en vez de reportar solo el híbrido.
-
-**Los pesos por defecto quedan en 0.5/0.5** aunque el barrido favorezca 0.3/0.7. Mover el
-default para ganar en un benchmark de 10 preguntas, donde cada una vale 10 puntos de recall,
-es ajustar el sistema al examen: la diferencia no es distinguible del ruido con esta muestra.
-El barrido queda documentado y a un flag de distancia (`--pesos 0.3 0.7`).
-
-**Sobre la columna `techo`.** El máximo de Precision@5 alcanzable promedia 0.86, no 1.00,
-porque tres documentos del corpus generan menos de 5 fragmentos: `type_adapter.md` produce 2
-(techo 0.40), y `strict_mode.md` y `performance.md` producen 3 (techo 0.60). El 0.74 del
+**La columna `techo`** promedia 0.86 y no 1.00 porque tres documentos generan menos de 5
+fragmentos (`type_adapter.md` produce 2; `strict_mode.md` y `performance.md`, 3). El 0.74 del
 vectorial es **86% del máximo posible**, no 74% de un ideal inalcanzable.
 
-## Errores de la consigna, y qué los evita acá
+## Errores evitados
 
 | Error | Mitigación |
 |---|---|
@@ -535,21 +329,3 @@ vectorial es **86% del máximo posible**, no 74% de un ideal inalcanzable.
 | Ignorar el namespace | Namespace obligatorio y versionado, configurable por `.env`; filtros por `categoria` dentro de él |
 | Subestimar el chunking | Tres configuraciones medidas; se eligió la de mediana 528 tokens y cero fragmentos minúsculos |
 | Sumar scores heterogéneos | RRF sobre posiciones (`EnsembleRetriever`), nunca suma de score BM25 + coseno |
-
-## Limitaciones conocidas
-
-- **Sin capa de generación.** La consigna pide un módulo de *recuperación*: el sistema
-  devuelve fragmentos, no respuestas. La generación fue el alcance de la pre-entrega 3.
-- **BM25 vive en memoria.** Se reconstruye en cada proceso leyendo el índice completo. Con
-  162 fragmentos tarda un segundo; con cientos de miles habría que persistir el índice
-  invertido o mover la búsqueda léxica a un servicio (los índices *sparse* de Pinecone, o
-  Elasticsearch).
-- **El golden set es chico.** 10 preguntas alcanzan para ver la diferencia entre modos, no
-  para medir mejoras de pocos puntos: cada pregunta pesa 10 puntos de Recall.
-- **La relevancia se juzga a nivel documento.** Un fragmento del archivo correcto que no
-  contenga la respuesta cuenta como acierto. Etiquetar fragmento por fragmento daría una
-  Precision más honesta, a costa de rehacer el golden set con cada cambio de chunking.
-- **Cuota gratuita de Gemini.** Es el factor que fija la duración de la ingesta: 11 lotes de
-  embedding con 20 segundos de pausa entre cada uno, ~4 minutos para 162 fragmentos. Con
-  cuota paga, los mismos lotes irían seguidos y bajaría a segundos. Las consultas gastan una
-  llamada por pregunta, muy por debajo del límite.

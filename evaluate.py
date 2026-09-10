@@ -130,16 +130,17 @@ def main() -> int:
     casos = cargar()
     tipos = sorted({caso.tipo for caso in casos})
 
-    # El corpus se baja una sola vez y se comparte entre todas las configuraciones: son
-    # los mismos fragmentos, y bajarlos por cada modo sería tiempo de red tirado.
-    necesita_corpus = any(modo in ("bm25", "hibrido") for modo in args.modos) or args.sweep
-    corpus = obtener_corpus(args.corpus, args.namespace) if necesita_corpus else []
+    # El corpus se baja una sola vez y se comparte entre todas las configuraciones: son los
+    # mismos fragmentos, y bajarlos por cada modo sería tiempo de red tirado. Se baja siempre,
+    # incluso evaluando solo el modo vectorial que no usa BM25, porque de acá sale también el
+    # conteo de fragmentos por documento y sin él la columna `techo` daría 0.00 en todo.
+    corpus = obtener_corpus(args.corpus, args.namespace)
     fragmentos_por_documento = Counter(d.metadata.get("source", "") for d in corpus)
 
     print(
         f"Evaluación de {INDEX_NAME}/{args.namespace}: {len(casos)} preguntas, "
-        f"top-{args.k}, corpus léxico desde {args.corpus}"
-        + (f", {len(corpus)} fragmentos de {len(fragmentos_por_documento)} documentos" if corpus else "")
+        f"top-{args.k}, corpus léxico desde {args.corpus}, "
+        f"{len(corpus)} fragmentos de {len(fragmentos_por_documento)} documentos"
     )
 
     reportes = []
