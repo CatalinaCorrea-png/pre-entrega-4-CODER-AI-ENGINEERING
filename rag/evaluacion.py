@@ -1,43 +1,88 @@
-"""Precision@k, Recall@k y MRR@k sobre el golden set.
+"""Golden set y métricas de recuperación.
 
-Las dos que pide la consigna son Precision@k y Recall@k. MRR se suma porque las otras dos
-son ciegas al orden: recuperar el documento correcto en la posición 1 o en la 5 da
-exactamente la misma Precision@5, y no es lo mismo — con `top_k` chico, lo que queda
-arriba es lo que termina llegando al LLM.
-
-Sobre el techo de Precision@k
------------------------------
-La consigna define Precision@5 como "qué porcentaje de los 5 recuperados son realmente
-útiles", y acá un fragmento cuenta como útil si viene de un documento esperado. Esa
-definición tiene un techo estructural que conviene tener presente al leer los números: si
-el documento correcto solo produjo 3 fragmentos, la Precision@5 máxima alcanzable es
-3/5 = 0.6 aunque el sistema haya funcionado perfecto. `techo_precision` lo calcula, para
-comparar el valor medido contra lo máximo posible en vez de contra un 1.0 inalcanzable.
+La consigna pide Precision@k y Recall@k. Se suman hit-rate y MRR porque las dos primeras
+son ciegas al orden, y con un top-k chico lo que queda arriba es lo que llega al LLM.
 """
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from statistics import mean
 
-from evaluacion.golden_set import Caso
+from .config import DATA_DIR, GOLDEN_SET_PATH, ErrorDeUso
 
+
+# --- El golden set: carga y validación --------------------------------------
+
+class GoldenSetInvalido(ErrorDeUso):
+    """El benchmark referencia documentos que no están en el corpus."""
+
+
+@dataclass(frozen=True)
+class Caso:
+    """Una pregunta del benchmark con su verdad de referencia."""
+
+    id: str
+    pregunta: str
+    documentos_esperados: frozenset[str]
+    tipo: str
+    nota: str = ""
+
+
+def _documentos_de(caso: dict) -> frozenset[str]:
+    """Acepta los dos formatos: lista o string único."""
+    if "documentos_esperados" in caso:
+        return frozenset(caso["documentos_esperados"])
+    if "documento_id_esperado" in caso:
+        return frozenset([caso["documento_id_esperado"]])
+    raise GoldenSetInvalido(
+        f"El caso {caso.get('id', caso)!r} no declara documentos esperados."
+    )
+
+
+def cargar(ruta: Path = GOLDEN_SET_PATH, validar_contra_corpus: bool = True) -> list[Caso]:
+    """Lee el golden set y verifica que cada documento esperado exista en `data/`."""
+    datos = json.loads(ruta.read_text(encoding="utf-8"))
+    casos = [
+        Caso(
+            id=caso.get("id", f"caso-{numero}"),
+            pregunta=caso["pregunta"],
+            documentos_esperados=_documentos_de(caso),
+            tipo=caso.get("tipo", "sin_tipo"),
+            nota=caso.get("nota", ""),
+        )
+        for numero, caso in enumerate(datos["casos"], start=1)
+    ]
+
+    if validar_contra_corpus:
+        existentes = {archivo.name for archivo in DATA_DIR.glob("*.md")}
+        faltantes = {
+            documento
+            for caso in casos
+            for documento in caso.documentos_esperados
+            if documento not in existentes
+        }
+        if faltantes:
+            raise GoldenSetInvalido(
+                f"El golden set espera documentos que no están en {DATA_DIR}: "
+                f"{', '.join(sorted(faltantes))}.\n"
+                "Corré: python scripts/descargar_dataset.py"
+            )
+
+    return casos
+
+
+# --- Las métricas -----------------------------------------------------------
 
 def precision_at_k(recuperados: list[str], relevantes: frozenset[str], k: int) -> float:
-    """Fracción de las k posiciones ocupada por fragmentos de un documento relevante.
-
-    Se divide por `k` y no por `len(recuperados)`: si el sistema devuelve 3 documentos en
-    vez de 5, dividir por 3 lo premiaría por haber recuperado de menos.
-    """
+    """Fracción de las k posiciones ocupada por fragmentos de un documento relevante."""
     if k <= 0:
         return 0.0
     return sum(1 for fuente in recuperados[:k] if fuente in relevantes) / k
 
 
 def recall_at_k(recuperados: list[str], relevantes: frozenset[str], k: int) -> float:
-    """Proporción de los documentos relevantes que aparece en el top-k.
-
-    A nivel documento, no de fragmento: cinco fragmentos del mismo archivo cuentan como un
-    documento recuperado, no como cinco.
-    """
+    """Proporción de los documentos relevantes que aparece en el top-k."""
     if not relevantes:
         return 0.0
     return len(set(recuperados[:k]) & relevantes) / len(relevantes)

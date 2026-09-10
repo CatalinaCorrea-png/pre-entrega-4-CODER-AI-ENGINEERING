@@ -1,27 +1,55 @@
-"""Infraestructura: cliente de Pinecone e índice Serverless idempotente.
+"""El modelo de embeddings y el índice de Pinecone.
 
-Dos reglas acá:
+Viven juntos porque `DIMENSION` tiene que ser la misma para los dos: una sola copia, a la
+vista, no puede divergir. Es lo que descarta el "mismatch de dimensiones".
 
-1. Crear el índice si no existe, y no romper si ya existe (se puede correr N veces).
-2. Si existe, **verificar que sea compatible** antes de que alguien intente escribirle.
-   Es lo que convierte el "mismatch de dimensiones" en un mensaje que dice qué hacer, en
-   lugar de un `400 Vector dimension 1536 does not match the dimension of the index 768`
-   a mitad de una ingesta ya empezada.
+La ingesta upserta con el SDK nativo, porque necesita controlar sus lotes; la consulta usa
+`PineconeVectorStore`, que es lo que `EnsembleRetriever` sabe consumir.
 """
 
 import time
 from functools import lru_cache
 
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_pinecone import PineconeVectorStore
 from pinecone import Pinecone, ServerlessSpec
 
-from ..config import (
+from .config import (
     INDEX_NAME,
+    NAMESPACE,
     PINECONE_CLOUD,
     PINECONE_REGION,
+    TEXT_KEY,
+    ErrorDeUso,
     variable_obligatoria,
 )
-from ..embeddings import DIMENSION, METRICA
-from ..errores import ErrorDeUso
+
+
+# --- El modelo de embeddings y la dimensión del índice ----------------------
+
+MODELO = "models/gemini-embedding-001"
+DIMENSION = 1536
+METRICA = "cosine"
+
+# Gemini pide declarar para qué se va a usar el vector. El modelo proyecta
+# distinto un pasaje que se va a indexar que una pregunta que lo busca, y usar el par
+# correcto mejora la recuperación sobre usar el mismo tipo para ambos lados.
+TASK_DOCUMENTO = "RETRIEVAL_DOCUMENT"
+TASK_CONSULTA = "RETRIEVAL_QUERY"
+
+
+@lru_cache(maxsize=2)
+def obtener_embeddings(task_type: str = TASK_DOCUMENTO) -> GoogleGenerativeAIEmbeddings:
+    """Cliente de embeddings, cacheado por task_type."""
+    return GoogleGenerativeAIEmbeddings(
+        model=MODELO,
+        google_api_key=variable_obligatoria("GOOGLE_API_KEY"),
+        output_dimensionality=DIMENSION,
+        task_type=task_type,
+    )
+
+
+# --- Cliente e índice Serverless, idempotente -------------------------------
 
 ESPERA_MAXIMA_SEGUNDOS = 120
 
@@ -41,13 +69,7 @@ def listar_indices() -> list[str]:
 
 
 def verificar_compatibilidad(nombre: str = INDEX_NAME) -> dict:
-    """Compara el índice existente contra la configuración local.
-
-    Falla ante una diferencia de dimensión o de métrica: son las dos cosas que no se
-    pueden corregir después. Un índice de 768 no acepta vectores de 1536, y un índice
-    creado con distancia euclidiana rankea distinto a uno con coseno aunque acepte los
-    mismos vectores — el segundo error es peor porque no lanza ninguna excepción.
-    """
+    """Compara el índice existente contra la configuración local."""
     descripcion = obtener_cliente().describe_index(nombre)
     problemas = []
 
@@ -120,3 +142,22 @@ def estadisticas(nombre: str = INDEX_NAME) -> dict:
             for nombre_ns, datos in (stats.get("namespaces") or {}).items()
         },
     }
+
+
+# --- El vector store del lado de la recuperación ----------------------------
+
+__all__ = ["obtener_vectorstore", "TASK_CONSULTA", "TASK_DOCUMENTO"]
+
+
+@lru_cache(maxsize=4)
+def obtener_vectorstore(
+    task_type: str = TASK_CONSULTA,
+    namespace: str = NAMESPACE,
+) -> PineconeVectorStore:
+    """Vector store apuntado al índice y namespace configurados."""
+    return PineconeVectorStore(
+        index=obtener_indice(),
+        embedding=obtener_embeddings(task_type),
+        text_key=TEXT_KEY,
+        namespace=namespace,
+    )

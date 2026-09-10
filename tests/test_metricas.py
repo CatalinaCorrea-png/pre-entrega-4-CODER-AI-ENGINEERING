@@ -12,18 +12,24 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from evaluacion.golden_set import cargar
-from evaluacion.metricas import (
+from rag.config import correr
+from rag.ingesta import (
+    aplicar_metadata,
+    fragmentar,
+    id_vector,
+    titulo_de,
+    titulo_desde_archivo,
+    CAMPOS,
+)
+from rag.recuperacion import tokenizar
+from rag.evaluacion import (
+    cargar,
     hit_at_k,
     mrr_at_k,
     precision_at_k,
     recall_at_k,
     techo_precision,
 )
-from rag.consola import correr
-from rag.ingesta.chunking import fragmentar
-from rag.ingesta.metadata import CAMPOS, aplicar_metadata, id_vector
-from rag.recuperacion.tokenizacion import tokenizar
 
 from langchain_core.documents import Document
 
@@ -78,6 +84,22 @@ def test_tokenizador_habilita_la_coincidencia_exacta():
     assert tokenizar("validación") == tokenizar("validacion")
 
 
+def test_titulo_no_confunde_un_comentario_con_un_encabezado():
+    # Un comentario de Python dentro de un bloque de código también empieza con "# ".
+    documento = "Texto introductorio sin encabezado.\n\n```python\n# normal copy da lo mismo\nx = 1\n```"
+    assert titulo_de(documento, "Models") == "Models"
+    # Un H1 real, en la primera línea con contenido, sí se usa.
+    assert titulo_de("\n\n# Performance tips\n\nMás texto.", "Performance") == "Performance tips"
+
+
+def test_titulo_de_respaldo_no_duplica_el_nombre_de_archivo():
+    # MkDocs saca el título de la navegación: 14 de los 16 documentos no tienen H1, y sin
+    # respaldo `titulo` quedaba igual a `source` y no aportaba nada.
+    assert titulo_desde_archivo("forward_annotations.md") == "Forward Annotations"
+    assert titulo_desde_archivo("json_schema.md") == "JSON Schema"
+    assert titulo_desde_archivo("models.md") == "Models"
+
+
 def test_metadata_cumple_el_contrato():
     documentos = [
         Document(page_content="uno\n\n" + "texto de prueba. " * 200, metadata={"source": "alias.md", "titulo": "Alias"}),
@@ -85,7 +107,7 @@ def test_metadata_cumple_el_contrato():
     ]
     chunks = aplicar_metadata(fragmentar(documentos))
 
-    esperados = set(CAMPOS) - {"text"}  # `text` lo inyecta PineconeVectorStore al subir
+    esperados = set(CAMPOS) - {"text"}  # `text` lo agrega subir(), no aplicar_metadata()
     for chunk in chunks:
         assert set(chunk.metadata) == esperados, chunk.metadata
 
@@ -121,9 +143,9 @@ def main() -> int:
             prueba()
         except AssertionError as error:
             fallidas += 1
-            print(f"❌ {prueba.__name__}: {error}")
+            print(f"FALLA  {prueba.__name__}: {error}")
         else:
-            print(f"✅ {prueba.__name__}")
+            print(f"ok     {prueba.__name__}")
 
     print(f"\n{len(pruebas) - fallidas}/{len(pruebas)} pruebas pasaron")
     return 1 if fallidas else 0

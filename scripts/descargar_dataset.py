@@ -1,12 +1,10 @@
 """Descarga el corpus: la documentación de conceptos de Pydantic.
 
-Por qué documentación técnica real y no un corpus inventado: la consigna lo sugiere, pero
-además es el escenario donde el recuperador híbrido se justifica. Estos documentos están
-llenos de identificadores exactos —`TypeAdapter`, `model_validator`, `ConfigDict`,
+Por qué documentación técnica real: Estos documentos están llenos de 
+identificadores exactos —`TypeAdapter`, `model_validator`, `ConfigDict`,
 `AliasGenerator`— que los embeddings confunden entre sí porque son semánticamente
 parecidísimos (todos hablan de "validar modelos"), y que BM25 distingue sin esfuerzo
-porque son literales distintos. Con un corpus de textos genéricos, BM25 no aportaría nada
-y el ensemble sería decorativo.
+porque son literales distintos.
 
 La descarga está clavada a un tag (`REF`), no a la rama principal: el corpus tiene que ser
 el mismo hoy y dentro de seis meses, o las métricas del README dejan de ser reproducibles.
@@ -21,9 +19,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from rag.config import DATA_DIR
-from rag.consola import correr
-from rag.ingesta.metadata import CATEGORIAS
+from rag.config import correr, DATA_DIR
+from rag.ingesta import CATEGORIAS
 
 REPO = "pydantic/pydantic"
 REF = "v2.13.5"
@@ -63,31 +60,26 @@ def descargar(archivo: str, destino: Path) -> int:
 
 def main() -> int:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"📥 Descargando {len(ARCHIVOS)} documentos de {REPO}@{REF}\n")
 
     total = 0
     fallidos = []
     for archivo in ARCHIVOS:
         try:
-            tamano = descargar(archivo, DATA_DIR / archivo)
+            total += descargar(archivo, DATA_DIR / archivo)
         except (urllib.error.URLError, urllib.error.HTTPError) as error:
-            fallidos.append(archivo)
-            print(f"   ✗ {archivo:<28} {error}")
-            continue
-        total += tamano
-        print(f"   ✓ {archivo:<28} {tamano:>7,} caracteres   [{CATEGORIAS[archivo]}]")
+            fallidos.append(f"{archivo} ({error})")
 
     (DATA_DIR / "FUENTE.txt").write_text(
         ATRIBUCION.format(repo=REPO, ruta=RUTA_EN_REPO, ref=REF), encoding="utf-8"
     )
 
-    print(f"\n📦 {len(ARCHIVOS) - len(fallidos)}/{len(ARCHIVOS)} documentos en {DATA_DIR}")
-    print(f"   {total:,} caracteres  (~{total // 4:,} tokens estimados)")
-
-    if fallidos:
-        print(f"\n⚠️  No se pudieron descargar: {', '.join(fallidos)}")
-        return 1
-    return 0
+    print(
+        f"{len(ARCHIVOS) - len(fallidos)}/{len(ARCHIVOS)} documentos de {REPO}@{REF} "
+        f"en {DATA_DIR} ({total:,} caracteres)"
+    )
+    for fallido in fallidos:
+        print(f"  no se pudo descargar: {fallido}")
+    return 1 if fallidos else 0
 
 
 if __name__ == "__main__":

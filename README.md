@@ -87,47 +87,159 @@ Los scripts funcionan invocados desde cualquier directorio.
 
 ## Mapa del entregable
 
-| Requisito de la consigna | Dónde |
+Cada requisito de la consigna y dónde está resuelto, **en orden de ejecución**.
+
+### 0 · Configuración de variables
+
+> *"Crea un archivo `.env` con `PINECONE_API_KEY`, `OPENAI_API_KEY` (o Anthropic) e `INDEX_NAME`."*
+
+| Qué | Dónde |
 |---|---|
-| Índice Serverless, creado si no existe | `rag/infra/pinecone_setup.py` · entrada `scripts/setup_indice.py` |
-| Variables de entorno (`.env`) | `.env.example` + `rag/config.py` → `variable_obligatoria()` |
-| Dimensión 1536 | `rag/embeddings.py` → `DIMENSION` (única fuente de verdad) |
-| Pipeline de ingesta | `rag/ingesta/` · entrada `scripts/ingestar.py` |
-| `RecursiveCharacterTextSplitter` | `rag/ingesta/chunking.py` |
-| Metadatos avanzados (fuente, categoría, etc.) | `rag/ingesta/metadata.py` → `CAMPOS` |
-| Texto original dentro de la metadata | `rag/ingesta/metadata.py` → `TEXT_KEY` + `rag/vectorstore.py` |
-| Batch upsert (100-200 vectores) | `rag/ingesta/upsert.py` → `subir()`, `LOTE_UPSERT` |
-| `PineconeVectorStore` de LangChain | `rag/vectorstore.py` (lado de recuperación) |
-| `BM25Retriever` | `rag/recuperacion/retrievers.py` → `retriever_bm25()` |
-| `EnsembleRetriever` | `rag/recuperacion/retrievers.py` → `retriever_hibrido()` |
-| Clase `RAGSystem` que devuelve el top-5 | `rag/recuperacion/rag_system.py` |
-| Golden set con documento esperado | `golden_set.json` — 10 casos |
-| `evaluate.py` con Precision@5 y Recall@5 | `evaluate.py` + `evaluacion/metricas.py` |
-| Reporte por consola | `evaluate.py` → `imprimir_comparativa()` |
+| Plantilla de variables | `.env.example` |
+| `INDEX_NAME` y namespace | `rag/config.py` → `INDEX_NAME`, `NAMESPACE` |
+| Región del índice serverless | `rag/config.py` → `PINECONE_CLOUD`, `PINECONE_REGION` |
+| Falla accionable si falta una clave | `rag/config.py` → `variable_obligatoria()` |
+| Que el `.env` nunca se suba | `.gitignore` |
+
+En lugar de `OPENAI_API_KEY` va `GOOGLE_API_KEY`: la consigna admite otro proveedor, y
+Gemini llega a las mismas 1536 dimensiones sin costo.
+
+### 1 · Dataset — `python scripts/descargar_dataset.py`
+
+> *"Carga un dataset de documentos técnicos (puedes usar la documentación de una librería de Python)."*
+
+| Qué | Dónde |
+|---|---|
+| Descarga los 16 `.md` de Pydantic, clavados al tag `v2.13.5` | `scripts/descargar_dataset.py` |
+| Qué archivos entran al corpus, y su categoría | `rag/ingesta.py` → `CATEGORIAS` |
+
+### 2 · Infraestructura — `python scripts/setup_indice.py`
+
+> *"Escribe un script de inicialización que verifique si el índice existe y lo cree si es necesario (modo Serverless)."* · *"Crea un índice Serverless (usa la dimensión 1536)."*
+
+| Qué | Dónde |
+|---|---|
+| Punto de entrada | `scripts/setup_indice.py` |
+| Crea si falta, valida si ya existe | `rag/pinecone.py` → `crear_indice_si_falta()` |
+| **Evita el mismatch de dimensiones** | `rag/pinecone.py` → `verificar_compatibilidad()` |
+| `DIMENSION = 1536`, única fuente de verdad | `rag/pinecone.py` → `DIMENSION` |
+| `ServerlessSpec(cloud, region)` | `rag/pinecone.py` → `crear_indice_si_falta()` |
+| Espera a que el índice quede listo | `rag/pinecone.py` → `esperar_a_que_este_listo()` |
+| **Namespace** (error a evitar) | `rag/config.py` → `NAMESPACE` |
+
+### 3 · Ingesta — `python scripts/ingestar.py`
+
+> *"Un script que tome un conjunto de documentos, los procese y los suba a un índice de Pinecone Serverless utilizando metadatos avanzados (fuente, página, etiquetas de categoría)."*
+
+Las cinco etapas viven en `rag/ingesta.py`, una debajo de la otra en el orden en que corren
+(cada una marcada con su separador `# --- N.`):
+
+| # | Qué hace | Dónde |
+|---|---|---|
+| 1 | Punto de entrada, orquesta todo | `scripts/ingestar.py` |
+| 2 | Limpia directivas de MkDocs | `rag/ingesta.py` → `limpiar()` |
+| 3 | Lee los `.md`, normaliza `source` | `rag/ingesta.py` → `cargar_documentos()` |
+| 4 | **`RecursiveCharacterTextSplitter`** | `rag/ingesta.py` → `obtener_splitter()` |
+| 5 | Chunking ~500-800 tokens (error a evitar) | `rag/ingesta.py` → `CHUNK_SIZE = 800`, `CHUNK_OVERLAP = 140` |
+| 6 | **Metadatos avanzados** — el contrato | `rag/ingesta.py` → `CAMPOS` |
+| 7 | Etiquetas de categoría | `rag/ingesta.py` → `categoria_de()` |
+| 8 | IDs determinísticos (upsert real, no duplicado) | `rag/ingesta.py` → `id_vector()` |
+| 9 | Arma la metadata de cada fragmento | `rag/ingesta.py` → `aplicar_metadata()` |
+| 10 | **Genera los embeddings**, lotes de 15 | `rag/ingesta.py` → `embeber()` |
+| 11 | **Batch upsert a Pinecone**, lotes de 100 | `rag/ingesta.py` → `subir()`, `LOTE_UPSERT` |
+| 12 | **Guarda el texto original en la metadata** | `rag/config.py` → `TEXT_KEY`, escrito en `subir()` |
+
+El punto 12 es el que la consigna subraya (*"guardá el texto original dentro de los
+metadatos para evitar consultas adicionales a una base relacional"*). `TEXT_KEY` vive en
+`config.py` y no en `ingesta.py` porque lo comparten tres módulos: la ingesta lo escribe, el
+vector store lo lee como `text_key`, y la recuperación lo usa para reconstruir el corpus de
+BM25.
+
+### 4 · Recuperador — lo usan los pasos 5 y 6
+
+> *"Crea una clase `RAGSystem` que encapsule un `EnsembleRetriever`. El sistema debe recibir una consulta y devolver los top-5 documentos combinando resultados léxicos y semánticos."*
+
+Todo en `rag/recuperacion.py`, ordenado de las piezas hacia la fachada:
+
+| Qué | Dónde |
+|---|---|
+| Tokenizador que hace funcionar a BM25 | `rag/recuperacion.py` → `tokenizar()` |
+| Corpus léxico traído desde Pinecone | `rag/recuperacion.py` → `corpus_desde_pinecone()` |
+| **`BM25Retriever`** | `rag/recuperacion.py` → `retriever_bm25()` |
+| Retriever vectorial (semántico) | `rag/recuperacion.py` → `retriever_vectorial()` |
+| **`EnsembleRetriever`** | `rag/recuperacion.py` → `retriever_hibrido()` |
+| Pesos de la fusión RRF | `rag/recuperacion.py` → `PESOS_POR_DEFECTO` |
+| **Clase `RAGSystem`** | `rag/recuperacion.py` → `RAGSystem` |
+| Recibe consulta → devuelve top-5 | `rag/recuperacion.py` → `RAGSystem.recuperar()` |
+| Mismo top-5 en dicts planos | `rag/recuperacion.py` → `RAGSystem.obtener_top_k()` |
+| **`PineconeVectorStore` de LangChain** | `rag/pinecone.py` → `obtener_vectorstore()` |
+
+Para probarlo a mano: `python scripts/consultar.py`.
+
+### 5 · Golden set
+
+> *"Crea un pequeño archivo JSON con pares `{"pregunta": "...", "documento_id_esperado": "..."}`"* · *"Define un benchmark de 5 preguntas."*
+
+| Qué | Dónde |
+|---|---|
+| El JSON, 10 casos (la consigna pide 5) | `golden_set.json` |
+| Lectura y validación contra el corpus | `rag/evaluacion.py` → `cargar()` |
+| Acepta el formato `documento_id_esperado` de la consigna | `rag/evaluacion.py` → `_documentos_de()` |
+
+### 6 · Evaluación — `python evaluate.py`
+
+> *"Crea un script `evaluate.py`... calcula Recall@5 y Precision@5... imprime en consola un breve resumen."*
+
+| Qué | Dónde |
+|---|---|
+| **El script que nombra la consigna** | `evaluate.py` |
+| **`Precision@5`** | `rag/evaluacion.py` → `precision_at_k()` |
+| **`Recall@5`** | `rag/evaluacion.py` → `recall_at_k()` |
+| "¿Está el documento correcto entre los 5?" | `rag/evaluacion.py` → `hit_at_k()` |
+| Extras: MRR y techo de precisión | `rag/evaluacion.py` → `mrr_at_k()`, `techo_precision()` |
+| Promedios sobre el golden set | `rag/evaluacion.py` → `Reporte` |
+| **Reporte por consola** | `evaluate.py` → `imprimir_comparativa()` |
+| Detalle pregunta por pregunta | `evaluate.py` → `imprimir_detalle()` |
+| Barrido de pesos | `evaluate.py` → `PESOS_DEL_BARRIDO`, `imprimir_barrido()` |
+
+### Fuera de la consigna
+
+`tests/test_metricas.py` (10 pruebas que corren sin red ni API keys) y `rag/config.py`
+(rutas, `ErrorDeUso` y consola UTF-8, que sostienen al resto).
 
 ## Estructura
 
 ```
-├── data/                       # corpus descargado (16 .md + FUENTE.txt)
-├── golden_set.json             # benchmark de 10 preguntas
-├── evaluate.py                 # script de evaluación (el que nombra la consigna)
-├── rag/                        # librería: no imprime ni se ejecuta sola
-│   ├── config.py               # rutas, .env, nombre de índice y namespace
-│   ├── embeddings.py           # modelo + DIMENSION + métrica
-│   ├── errores.py              # ErrorDeUso: fallas de configuración, no bugs
-│   ├── consola.py              # UTF-8 en Windows + correr()
-│   ├── vectorstore.py          # PineconeVectorStore compartido
-│   ├── infra/                  # cliente e índice serverless
-│   ├── ingesta/                # preprocessing → chunking → metadata → upsert
-│   └── recuperacion/           # corpus, tokenización, retrievers, RAGSystem
-├── evaluacion/                 # golden set + métricas
-├── scripts/                    # puntos de entrada ejecutables
-└── tests/                      # pruebas offline
+├── data/                    # corpus descargado (16 .md + FUENTE.txt)
+├── golden_set.json          # benchmark de 10 preguntas
+├── evaluate.py              # script de evaluación (el que nombra la consigna)
+├── rag/                     # librería: no imprime ni se ejecuta sola
+│   ├── config.py            # rutas, .env, ErrorDeUso, consola
+│   ├── pinecone.py          # embeddings + índice serverless + vector store
+│   ├── ingesta.py           # limpiar → fragmentar → metadata → embeber → subir
+│   ├── recuperacion.py      # tokenizador, corpus, retrievers, RAGSystem
+│   └── evaluacion.py        # golden set + métricas
+├── scripts/                 # puntos de entrada ejecutables
+│   ├── descargar_dataset.py
+│   ├── setup_indice.py
+│   ├── ingestar.py
+│   └── consultar.py
+└── tests/test_metricas.py   # pruebas offline, sin red ni API keys
 ```
 
-Los parámetros de cada etapa viven en el módulo que los aplica (`CHUNK_SIZE` en
-`chunking.py`, `PESOS_POR_DEFECTO` en `retrievers.py`), no centralizados: se leen junto al
-código que los usa. `config.py` guarda solo lo que necesita más de un módulo.
+Cinco módulos de librería, uno por responsabilidad, y cada uno se lee de arriba abajo en el
+orden en que se ejecuta. `rag/ingesta.py` recorre las cinco etapas del pipeline en secuencia;
+`rag/recuperacion.py` va del tokenizador hasta `RAGSystem`. La alternativa —un archivo por
+etapa— daba 28 archivos para 1.000 líneas de código y obligaba a saltar entre cinco de ellos
+para seguir un solo flujo.
+
+`embeddings` y `pinecone` viven juntos a propósito: `DIMENSION` tiene que ser la misma para
+el modelo y para el índice, y a la vista uno del otro no hay dos copias que puedan divergir.
+
+Los parámetros de cada etapa viven junto al código que los aplica (`CHUNK_SIZE` con el
+splitter, `PESOS_POR_DEFECTO` con el ensemble), no centralizados. `config.py` guarda solo lo
+que necesita más de un módulo — incluido `TEXT_KEY`, que escriben la ingesta, el vector store
+y la recuperación, y que tiene que coincidir en los tres.
 
 La inicialización es **perezosa**: importar `rag` no contacta a Pinecone ni descarga el
 corpus. `RAGSystem` paga ese trabajo en la primera consulta y lo cachea.
@@ -168,7 +280,7 @@ la mediana en 528 y ningún fragmento minúsculo.
 
 ### Un solo número para la dimensión
 
-`DIMENSION = 1536` vive en `rag/embeddings.py` y de ahí la leen el setup del índice y la
+`DIMENSION = 1536` vive en `rag/pinecone.py` y de ahí la leen el setup del índice y la
 ingesta. El "mismatch de dimensiones" que la consigna marca como error típico solo puede
 ocurrir si el número está escrito dos veces y las copias divergen. Además,
 `crear_indice_si_falta()` compara contra el índice existente y aborta antes de generar el
@@ -199,7 +311,7 @@ primer lote — 100 fragmentos de este corpus son ~50.000 tokens de golpe. Midie
 API, ~8.000 tokens pasan y ~16.000 ya fallan.
 
 Por eso la ingesta corre en dos fases explícitas (`embeber()` y `subir()` en
-`rag/ingesta/upsert.py`) en lugar de delegar ambas en el vectorstore, que las hace juntas y
+`rag/ingesta.py`) en lugar de delegar ambas en el vectorstore, que las hace juntas y
 deja el tamaño del lote de embedding fuera de nuestro control. Entre lotes de embedding hay
 una pausa de 20 segundos para no volver a agotar la cuota, y el backoff de los reintentos
 arranca en 65 segundos: la cuota de Gemini se repone por ventana de un minuto, así que un
@@ -227,7 +339,7 @@ corpus, el indexado en la nube y el del disco de quien corre el script. Si algui
 `data/` sin reingestar, o cambia `CHUNK_SIZE`, el ensemble fusiona rankings de universos
 distintos. No falla: devuelve métricas que no significan nada.
 
-`rag/recuperacion/corpus.py` pagina el namespace y reconstruye los fragmentos desde
+`rag/recuperacion.py` pagina el namespace y reconstruye los fragmentos desde
 `metadata["text"]` — que es exactamente para lo que la consigna pide guardar el texto ahí.
 Una sola fuente de verdad. `--corpus local` queda como salida de emergencia sin red.
 
@@ -241,7 +353,7 @@ Una sola fuente de verdad. `--corpus local` queda como salida de emergencia sin 
 
 `TypeAdapter?` con el signo pegado no es el mismo término que el `TypeAdapter` del
 documento, así que la coincidencia exacta —el único aporte real de BM25 frente al
-vectorial— no ocurre. `rag/recuperacion/tokenizacion.py` normaliza ambos lados igual:
+vectorial— no ocurre. `rag/recuperacion.py` normaliza ambos lados igual:
 minúsculas, sin acentos, cortando por todo lo que no sea letra, dígito o guion bajo. El
 guion bajo se conserva porque en Python es parte del identificador: `model_validator` es un
 término, no dos.
@@ -260,12 +372,27 @@ la Precision@5 estaría midiendo otra cosa.
 
 ### Metadatos: un esquema, no campos sueltos
 
-`rag/ingesta/metadata.py` es el único lugar donde se construye la metadata, y `CAMPOS`
+`rag/ingesta.py` es el único lugar donde se construye la metadata, y `CAMPOS`
 documenta el contrato. Es la defensa contra el **schema drift** de la clase: si un proceso
 escribe `categoria` y otro `category`, ningún filtro falla — devuelven cero resultados y el
 sistema parece andar. La categoría (`modelado`, `validacion`, `serializacion`, `tipos`,
 `configuracion`) habilita el hard filter: `--categoria validacion` acota el espacio de
 búsqueda antes de comparar similitud.
+
+Los nueve campos: `text`, `source`, `titulo`, `categoria`, `doc_type`, `chunk_index`,
+`total_chunks`, `n_caracteres` y `url`. La consigna menciona *página* entre los metadatos
+esperados; este corpus es Markdown y no tiene paginación, así que el análogo posicional son
+`chunk_index` / `total_chunks`, que ubican cada fragmento dentro de su documento. `url`
+cumple la otra mitad de esa función: permite citar la fuente exacta y verificable.
+
+`titulo` estuvo mal calculado hasta que se detectó auditando la metadata ingestada. MkDocs
+saca el título de la navegación, no del cuerpo, y 14 de los 16 documentos no tienen ningún
+H1: el campo caía al nombre de archivo y quedaba duplicando `source` — peso muerto en cada
+uno de los 162 vectores. Peor todavía, la búsqueda del H1 recorría todo el documento y un
+comentario de Python dentro de un bloque de código también empieza con `# `, así que
+`models.md` terminó titulado *"normal copy gives the same object reference for bar:"*. Ahora
+se mira solo la primera línea con contenido, con respaldo derivado del nombre de archivo
+(`json_schema.md` → *JSON Schema*), y hay dos pruebas que lo cubren.
 
 ### IDs determinísticos
 
@@ -297,7 +424,7 @@ experimento:
 Dos casos declaran **más de un** documento relevante. El notebook de la clase señala que
 con un único `documento_id_esperado` el Recall@5 solo puede dar 0 o 1; con dos documentos
 relevantes puede dar 0.5, y la métrica distingue "recuperó la mitad" de "no recuperó nada".
-`evaluacion/golden_set.py` acepta igual el formato de un solo documento de la consigna.
+`rag/evaluacion.py` acepta igual el formato de un solo documento de la consigna.
 
 ### Cómo se calculan las métricas
 
@@ -374,6 +501,13 @@ saca a BM25 mejora *todas* las métricas, y en 0.3/0.7 el híbrido converge exac
 números del vectorial puro (0.74 / 1.00 / 0.95). No hay una mezcla que supere a ninguna de
 las dos partes: la mejor configuración del ensemble es la que más se parece a no tener
 ensemble.
+
+**Aclaración importante, porque el número se puede leer mal:** que el híbrido no le gane al
+vectorial **no** indica que el ensemble esté mal implementado. La prueba de que la fusión
+funciona es la fila de las semánticas: BM25 solo tiene 0.17 de recall ahí, y al fusionarlo
+con el vectorial el híbrido sube a 1.00. El ensemble está recuperando exactamente lo que
+tiene que recuperar. Lo que el experimento muestra es una propiedad *de este corpus con este
+modelo de embeddings*, no un defecto del código.
 
 **5. Conclusión honesta: acá el híbrido es un seguro, no una mejora.** Cuesta ~12 puntos de
 precisión para cubrir un modo de falla que este recuperador vectorial no tiene sobre este
